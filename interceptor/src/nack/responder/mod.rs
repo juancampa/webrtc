@@ -13,11 +13,13 @@ use crate::nack::stream_support_nack;
 
 use async_trait::async_trait;
 use rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 /// GeneratorBuilder can be used to configure Responder Interceptor
 #[derive(Default)]
@@ -58,24 +60,52 @@ impl ResponderInternal {
     async fn resend_packets(
         streams: Arc<Mutex<HashMap<u32, Arc<ResponderStream>>>>,
         nack: TransportLayerNack,
+        tracker: Arc<Mutex<BTreeMap<u16, usize>>>,
     ) {
         let stream = {
             let m = streams.lock().await;
             if let Some(stream) = m.get(&nack.media_ssrc) {
                 stream.clone()
             } else {
+                log::error!("Failed to get stream");
                 return;
             }
         };
 
+        // log::debug!("Retransmitting {}", seq);
         for n in &nack.nacks {
             let stream2 = Arc::clone(&stream);
+            let tracker2 = Arc::clone(&tracker);
             n.range(Box::new(
                 move |seq: u16| -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
                     let stream3 = Arc::clone(&stream2);
+                    let tracker3 = Arc::clone(&tracker2);
                     Box::pin(async move {
                         if let Some(p) = stream3.get(seq).await {
                             let a = Attributes::new();
+                            let mut tracker = tracker3.lock().await;
+                            let older: Vec<_> =
+                                tracker.keys().cloned().take_while(|k| *k < seq).collect();
+                            if older.len() > 0 {
+                                log::warn!(
+                                    "Sending {} but there are {} older ones: {:?}",
+                                    seq,
+                                    older.len(),
+                                    older
+                                )
+                            }
+                            match tracker.entry(seq) {
+                                Entry::Vacant(_) => {
+                                    unreachable!()
+                                }
+                                Entry::Occupied(mut entry) => {
+                                    if *entry.get() > 1 {
+                                        (*entry.get_mut()) -= 1;
+                                    } else {
+                                        entry.remove();
+                                    }
+                                }
+                            }
                             if let Err(err) = stream3.next_rtp_writer.write(&p, &a).await {
                                 log::warn!("failed resending nacked packet: {}", err);
                             }
@@ -88,11 +118,23 @@ impl ResponderInternal {
             .await;
         }
     }
+
+    async fn retransmit_loop(
+        mut rx: mpsc::UnboundedReceiver<(Streams, TransportLayerNack)>,
+        tracker: Arc<Mutex<BTreeMap<u16, usize>>>,
+    ) {
+        while let Some((streams, nack)) = rx.recv().await {
+            Self::resend_packets(streams, nack, tracker.clone()).await;
+        }
+    }
 }
 
+type Streams = Arc<Mutex<HashMap<u32, Arc<ResponderStream>>>>;
 pub struct ResponderRtcpReader {
     parent_rtcp_reader: Arc<dyn RTCPReader + Send + Sync>,
     internal: Arc<ResponderInternal>,
+    tracker: Arc<Mutex<BTreeMap<u16, usize>>>,
+    retransmit_tx: mpsc::UnboundedSender<(Streams, TransportLayerNack)>,
 }
 
 #[async_trait]
@@ -102,13 +144,30 @@ impl RTCPReader for ResponderRtcpReader {
 
         let mut b = &buf[..n];
         let pkts = rtcp::packet::unmarshal(&mut b)?;
+        let mut tracker = self.tracker.lock().await;
         for p in &pkts {
             if let Some(nack) = p.as_any().downcast_ref::<TransportLayerNack>() {
+                for nack in &nack.nacks {
+                    for packet in nack.into_iter() {
+                        match tracker.entry(packet) {
+                            Entry::Occupied(mut entry) => {
+                                (*entry.get_mut()) += 1;
+                            }
+                            Entry::Vacant(entry) => {
+                                entry.insert(1);
+                            }
+                        }
+                    }
+                }
                 let nack = nack.clone();
                 let streams = Arc::clone(&self.internal.streams);
-                tokio::spawn(async move {
-                    ResponderInternal::resend_packets(streams, nack).await;
-                });
+                if let Err(err) = self.retransmit_tx.send((streams, nack)) {
+                    log::error!("Failed to enqueue retransmission: {}", err);
+                }
+                // let tracker = Arc::clone(&self.tracker);
+                // tokio::spawn(async move {
+                //     ResponderInternal::resend_packets(streams, nack, tracker).await;
+                // });
             }
         }
 
@@ -136,9 +195,16 @@ impl Interceptor for Responder {
         &self,
         reader: Arc<dyn RTCPReader + Send + Sync>,
     ) -> Arc<dyn RTCPReader + Send + Sync> {
+        let (retransmit_tx, rx) = mpsc::unbounded_channel();
+
+        let tracker: Arc<Mutex<BTreeMap<u16, usize>>> = Default::default();
+        tokio::spawn(ResponderInternal::retransmit_loop(rx, tracker.clone()));
+
         Arc::new(ResponderRtcpReader {
             internal: Arc::clone(&self.internal),
             parent_rtcp_reader: reader,
+            tracker,
+            retransmit_tx,
         }) as Arc<dyn RTCPReader + Send + Sync>
     }
 
