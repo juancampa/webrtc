@@ -77,6 +77,8 @@ impl RTCRtpCodecCapability {
             Ok(Box::new(vp8_payloader))
         } else if mime_type == MIME_TYPE_VP9.to_lowercase() {
             Ok(Box::<rtp::codecs::vp9::Vp9Payloader>::default())
+        } else if mime_type == MIME_TYPE_AV1.to_lowercase() {
+            Ok(Box::<rtp::codecs::av1::AV1Payloader>::default())
         } else if mime_type == MIME_TYPE_OPUS.to_lowercase() {
             Ok(Box::<rtp::codecs::opus::OpusPayloader>::default())
         } else if mime_type == MIME_TYPE_G722.to_lowercase()

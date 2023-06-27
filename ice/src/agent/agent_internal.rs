@@ -956,12 +956,12 @@ impl AgentInternal {
                 }
             }
 
-            log::trace!(
-                "[{}]: inbound STUN (Request) from {} to {}",
-                self.get_name(),
-                remote,
-                local
-            );
+            // log::trace!(
+            //     "[{}]: inbound STUN (Request) from {} to {}",
+            //     self.get_name(),
+            //     remote,
+            //     local
+            // );
 
             if let Some(rc) = &remote_candidate {
                 self.handle_binding_request(m, local, rc).await;
