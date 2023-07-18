@@ -155,7 +155,7 @@ impl AV1Payloader {
         // );
         while payload_data_remaining > 0 {
             let current_fragment_size = std::cmp::min(max_fragment_size, payload_data_remaining);
-            let leb128_size = if current_fragment_size >= 127 { 2 } else { 1 };
+            let leb128_size = if current_fragment_size > 127 { 2 } else { 1 };
             let mut out = BytesMut::with_capacity(
                 AV1_PAYLOADER_HEADER_SIZE + leb128_size + current_fragment_size,
             );
